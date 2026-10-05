@@ -11,7 +11,15 @@
 #
 # Nodig: deze computer is al met "netbird up" aan je NetBird-account gekoppeld,
 # en een NetBird API-token (Settings -> Personal Access Tokens). Het token wordt
-# alleen tijdens dit script gebruikt en NERGENS opgeslagen.
+# alleen tijdens dit script gebruikt en NERGENS opgeslagen. Maak het met een
+# korte geldigheid (1 dag) en verwijder het daarna in het dashboard.
+#
+# Ook:
+#   - alleen het EU-proxycluster (eu.proxy.netbird.io) wordt gebruikt
+#     (AVG: bezoekersverkeer via de EU). Anders stopt het script;
+#   - deze computer komt in de NetBird-groep "webbuilder-kastjes", zodat je
+#     met policies kunt regelen waar hij wel en niet bij mag;
+#   - een waarschuwing als de "Default"-policy (iedereen mag overal bij) nog aan staat.
 set -eu
 
 API="${NB_API_URL:-https://api.netbird.io}"
@@ -55,6 +63,7 @@ if [ -z "$TOKEN" ]; then
   echo
   echo "Voor het automatisch instellen is een NetBird API-token nodig:"
   echo "  app.netbird.io -> Settings -> Personal Access Tokens -> Create Token"
+  echo "  (kies een korte geldigheid, bv. 1 dag; het token wordt nergens opgeslagen)"
   echo "(Leeg laten = de stappen voor het NetBird-dashboard laten zien.)"
   TOKEN=$(ask_secret "NetBird API-token")
 fi
@@ -62,7 +71,8 @@ fi
 if [ -z "$TOKEN" ]; then
   say "Handmatig instellen in het NetBird-dashboard"
   cat <<TXT
-1. Reverse Proxy -> Custom Domains -> Add Domain: $BASE (kies proxy cluster eu.proxy.netbird.io)
+0. Zet deze computer in de groep "webbuilder-kastjes" (Peers -> deze computer -> Groups)
+1. Reverse Proxy -> Custom Domains -> Add Domain: $BASE (kies proxy cluster eu.proxy.netbird.io - alleen EU!)
 2. Zet bij je domeinprovider:  CNAME  *.$BASE  ->  (het adres dat NetBird toont, bv. eu.proxy.netbird.io)
    en klik daarna in NetBird op "Verify Domain".
 3. Reverse Proxy -> Services -> Add Service:
@@ -89,9 +99,40 @@ PEER_ID=$(echo "$PEERS" | jq -r '.[0].id // empty')
 [ -n "$PEER_ID" ] || fail "Deze computer ($NB_IP) staat niet in je NetBird-account."
 echo "Deze computer: $(echo "$PEERS" | jq -r '.[0].name') ($NB_IP)"
 
+say "Toegang (groepen en policies)"
+GROUP="${NB_GROUP:-webbuilder-kastjes}"
+G=$(api GET /api/groups | jq -c --arg g "$GROUP" '[.[]? | select(.name == $g)][0] // empty')
+if [ -z "$G" ]; then
+  RES=$(api POST /api/groups "$(jq -nc --arg g "$GROUP" --arg p "$PEER_ID" '{name: $g, peers: [$p]}')")
+  if echo "$RES" | jq -e '.id' >/dev/null 2>&1; then echo "Groep $GROUP aangemaakt met deze computer erin."; else echo "Let op: groep $GROUP aanmaken lukte niet: $(echo "$RES" | head -c 200)"; fi
+elif ! echo "$G" | jq -e --arg p "$PEER_ID" '[.peers[]? | (.id // .)] | index($p)' >/dev/null; then
+  BODY=$(echo "$G" | jq -c --arg p "$PEER_ID" '{name: .name, peers: ([.peers[]? | (.id // .)] + [$p] | unique)}')
+  RES=$(api PUT "/api/groups/$(echo "$G" | jq -r '.id')" "$BODY")
+  if echo "$RES" | jq -e '.id' >/dev/null 2>&1; then echo "Deze computer is toegevoegd aan groep $GROUP."; else echo "Let op: toevoegen aan $GROUP lukte niet: $(echo "$RES" | head -c 200)"; fi
+else
+  echo "Deze computer zit al in groep $GROUP."
+fi
+OPEN=$(api GET /api/policies | jq -r '[.[]? | select(.enabled) | select(any(.rules[]?; any(.sources[]?; (.name // .) == "All") and any(.destinations[]?; (.name // .) == "All"))) | .name] | join(", ")' 2>/dev/null || true)
+if [ -n "$OPEN" ]; then
+  cat <<TXT
+LET OP: de policy "$OPEN" staat aan. Daarmee mag elk apparaat in je NetBird bij
+elk ander apparaat - dus ook dit kastje bij je eigen computers, en de kastjes
+onderling. Zet hem uit en maak in plaats daarvan (Access Control -> Policies):
+  - "beheer -> $GROUP"          jouw eigen apparaten mogen bij de kastjes (SSH, poort 8110)
+  - "$GROUP -> beheerservice"   alleen naar de poorten van de back-upserver/kluis/meldingen
+Zie de README, onderdeel "NetBird-toegang".
+TXT
+else
+  echo "Geen open \"iedereen mag overal bij\"-policy gevonden."
+fi
+
 CLUSTERS=$(api GET /api/reverse-proxies/clusters)
-CLUSTER=$(echo "$CLUSTERS" | jq -r '[.[] | select(.online != false)] | (map(select(.address | startswith("eu."))) + .)[0].address // empty')
-[ -n "$CLUSTER" ] || fail "Geen NetBird proxy-cluster gevonden. Staat Reverse Proxy aan in je account?"
+CLUSTER=$(echo "$CLUSTERS" | jq -r '[.[]? | select(.online != false) | select(.address | startswith("eu."))][0].address // empty')
+if [ -z "$CLUSTER" ]; then
+  [ "${NB_ALLOW_NON_EU:-}" = "1" ] || fail "Geen proxy-cluster in de EU (eu.…) gevonden ($(echo "$CLUSTERS" | jq -r '[.[]?.address] | join(", ")' 2>/dev/null)). Voor de AVG loopt bezoekersverkeer alleen via de EU. Bewust anders? Draai dan met NB_ALLOW_NON_EU=1."
+  CLUSTER=$(echo "$CLUSTERS" | jq -r '[.[]? | select(.online != false)][0].address // empty')
+  [ -n "$CLUSTER" ] || fail "Geen NetBird proxy-cluster gevonden. Staat Reverse Proxy aan in je account?"
+fi
 echo "Proxy-cluster: $CLUSTER"
 
 say "Domein $BASE"

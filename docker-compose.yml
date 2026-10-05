@@ -11,8 +11,8 @@
 #   frontend  de website zelf (nginx)
 #   caddy     HTTPS-certificaat + doorsturen naar de website (profiel "https";
 #             niet nodig als je al een reverse proxy hebt, zoals Nginx Proxy Manager)
-#   onderhoud dagelijkse back-up van de database + automatisch bijwerken
-#             (profiel "autoupdate")
+#   onderhoud dagelijkse back-up, automatisch bijwerken, bewaking en
+#             (met de beheerservice) externe back-up (profiel "autoupdate")
 # Welke profielen aan staan bepaalt COMPOSE_PROFILES in .env.
 
 name: ${COMPOSE_PROJECT_NAME:-webbuilder}
@@ -53,6 +53,8 @@ services:
       - backend
     ports:
       # Met Caddy (profiel "https") alleen bereikbaar op de server zelf.
+      # Met NetBird: het NetBird-adres van deze computer (alleen via de tunnel
+      # bereikbaar, niet op het lokale netwerk).
       # Eigen reverse proxy (bv. Nginx Proxy Manager)? Zet in .env
       # FRONTEND_BIND=0.0.0.0 en stuur je proxy door naar deze poort.
       - "${FRONTEND_BIND:-127.0.0.1}:${FRONTEND_PORT:-8110}:80"
@@ -79,11 +81,15 @@ services:
     profiles: ["autoupdate"]
     depends_on:
       - backend
+    # Leest ook de meldingen (NTFY_URL), bewaking (HEARTBEAT_URL) en externe
+    # back-up (OFFSITE_REPO) uit .env.
+    env_file: .env
     environment:
       PROJECT_DIR: ${PROJECT_DIR:-/opt/webbuilder}
       COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-webbuilder}
       UPDATE_HOUR: ${UPDATE_HOUR:-4}
       AUTO_UPDATE: ${AUTO_UPDATE:-true}
+      UPDATE_DELAY_DAYS: ${UPDATE_DELAY_DAYS:-0}
       BACKUP_KEEP: ${BACKUP_KEEP:-14}
       POSTGRES_USER: ${POSTGRES_USER:-webbuilder}
       POSTGRES_DB: ${POSTGRES_DB:-webbuilder}
@@ -91,7 +97,12 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Zelfde pad binnen als buiten, zodat docker compose de mappen en .env
-      # precies zo ziet als op de server.
-      - ${PROJECT_DIR:-/opt/webbuilder}:${PROJECT_DIR:-/opt/webbuilder}
+      # precies zo ziet als op de server. "rslave": ziet ook de versleutelde
+      # gegevensmap als die pas na het starten wordt ontgrendeld.
+      - type: bind
+        source: ${PROJECT_DIR:-/opt/webbuilder}
+        target: ${PROJECT_DIR:-/opt/webbuilder}
+        bind:
+          propagation: rslave
     working_dir: ${PROJECT_DIR:-/opt/webbuilder}
     entrypoint: ["sh", "${PROJECT_DIR:-/opt/webbuilder}/onderhoud.sh"]

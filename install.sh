@@ -18,6 +18,9 @@
 #      met willekeurig gemaakte wachtwoorden en sleutels
 #   4. start alles, koppelt (bij NetBird) het domein en laat de link +
 #      installatiecode zien
+#   5. biedt aan de computer te beveiligen (updates, SSH, firewall) en - als
+#      extra dienst - de beheerservice aan te zetten (externe back-up en
+#      versleutelde gegevensmap). Zonder beheerservice werkt alles gewoon lokaal.
 # Daarna open je de website en doorloop je de installatie-wizard.
 set -eu
 
@@ -66,7 +69,9 @@ cd "$INSTALL_DIR"
 say "Bestanden ophalen"
 $SUDO curl -fsSL "$REPO_RAW/docker-compose.yml" -o docker-compose.yml
 $SUDO curl -fsSL "$REPO_RAW/onderhoud.sh" -o onderhoud.sh
-$SUDO curl -fsSL "$REPO_RAW/netbird-website.sh" -o netbird-website.sh
+for f in netbird-website.sh start.sh beheerservice.sh beveilig-server.sh; do
+  $SUDO curl -fsSL "$REPO_RAW/$f" -o "$f"
+done
 
 # 3. Vragen
 say "Hoe wordt de website bereikbaar?"
@@ -94,7 +99,9 @@ case "$MODE" in
     if ! $SUDO netbird status 2>/dev/null | grep -q "Management: Connected"; then
       echo
       echo "Koppel deze computer aan je NetBird-account. Maak een setup key aan in"
-      echo "app.netbird.io -> Setup Keys -> Create Setup Key (bij voorkeur eenmalig te gebruiken)."
+      echo "app.netbird.io -> Setup Keys -> Create Setup Key."
+      echo "Kies: eenmalig te gebruiken (One-off), korte geldigheid (bv. 1 dag), en de groep"
+      echo "\"webbuilder-kastjes\" (zie README: zo mag dit kastje alleen bij wat nodig is)."
       NB_KEY=$(ask "NetBird setup key" "")
       [ -n "$NB_KEY" ] || { echo "Zonder setup key kan NetBird niet gekoppeld worden."; exit 1; }
       command -v netbird >/dev/null 2>&1 || curl -fsSL https://pkgs.netbird.io/install.sh | $SUDO sh
@@ -102,11 +109,18 @@ case "$MODE" in
     else
       echo "Deze computer is al met NetBird verbonden."
     fi
-    if command -v apt-get >/dev/null 2>&1 && [ "$(ask 'Automatische beveiligingsupdates voor het systeem aanzetten? (j/n)' j)" = "j" ]; then
-      $SUDO apt-get install -y -q unattended-upgrades >/dev/null 2>&1 && \
-        echo 'APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";' | $SUDO tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null && echo "Aan."
-    fi
+    # De website luistert alleen op het NetBird-adres: bereikbaar via de
+    # tunnel (voor bezoekers via de NetBird-proxy, en voor jou), niet op het
+    # lokale netwerk van de vereniging.
+    i=0
+    NB_IP=""
+    while [ -z "$NB_IP" ] && [ $i -lt 30 ]; do
+      NB_IP=$($SUDO netbird status --json 2>/dev/null | jq -r '.netbirdIp // empty' | cut -d/ -f1)
+      [ -n "$NB_IP" ] || sleep 2
+      i=$((i + 1))
+    done
+    [ -n "$NB_IP" ] || { echo "NetBird heeft nog geen adres. Controleer: netbird status"; exit 1; }
+    BIND="$NB_IP"
     ;;
   2)
     DOMAIN=$(ask "Domeinnaam van de website (bv. www.mijnvereniging.nl)" "")
@@ -125,6 +139,20 @@ APT::Periodic::Unattended-Upgrade "1";' | $SUDO tee /etc/apt/apt.conf.d/20auto-u
 esac
 AUTO=$(ask "Automatisch bijwerken naar nieuwe versies? (j/n)" j)
 [ "$AUTO" = "j" ] && AUTO_UPDATE=true || AUTO_UPDATE=false
+DELAY=0
+if [ "$AUTO_UPDATE" = "true" ]; then
+  DELAY=$(ask "Nieuwe versies na hoeveel dagen installeren? (0 = meteen, voor een testkastje)" 3)
+  case "$DELAY" in ''|*[!0-9]*) DELAY=3 ;; esac
+fi
+
+say "Meldingen en bewaking (optioneel)"
+echo "Krijg een pushmelding (ntfy-app) als er iets misgaat, en laat Uptime Kuma"
+echo "bewaken of dit kastje nog leeft. Leeg laten = uit (kan later in .env)."
+echo "Gebruik je straks de beheerservice, laat dit dan leeg: dat regelt de koppelcode."
+NTFY=$(ask "ntfy-adres (bv. https://ntfy.voorbeeld.nl/webbuilder-vereniging)" "")
+NTFY_TOKEN=""
+[ -n "$NTFY" ] && NTFY_TOKEN=$(ask "ntfy-token (leeg als je server er geen vraagt)" "")
+HEARTBEAT=$(ask "Uptime Kuma push-adres (leeg = geen)" "")
 NAME=$(basename "$INSTALL_DIR" | tr -cd 'a-z0-9-' )
 [ -n "$NAME" ] || NAME=webbuilder
 CODE="$(rand 4 | tr 'a-f' 'A-F')-$(rand 4 | tr 'a-f' 'A-F')"
@@ -143,12 +171,23 @@ IMAGE_PREFIX=$IMAGE_PREFIX
 WEBBUILDER_VERSION=latest
 AUTO_UPDATE=$AUTO_UPDATE
 UPDATE_HOUR=4
+# Nieuwe versies pas na zoveel dagen installeren (0 = meteen; testkastjes).
+UPDATE_DELAY_DAYS=$DELAY
 
 # Bereikbaarheid: 1 = NetBird, 2 = Caddy (eigen domein), 3 = eigen reverse proxy
 ACCESS_MODE=$MODE
 DOMAIN=$DOMAIN
 FRONTEND_BIND=$BIND
 FRONTEND_PORT=$PORT
+# Aantal proxies vóór de backend (NetBird/Caddy/eigen proxy + de website zelf).
+# Zo ziet de website het echte IP-adres van bezoekers. Controleren kan in
+# Systeeminstellingen -> Verbinding.
+TRUST_PROXY=2
+
+# Meldingen (ntfy) en bewaking (Uptime Kuma push). Leeg = uit.
+NTFY_URL=$NTFY
+NTFY_TOKEN=$NTFY_TOKEN
+HEARTBEAT_URL=$HEARTBEAT
 
 POSTGRES_USER=webbuilder
 POSTGRES_DB=webbuilder
@@ -175,9 +214,30 @@ done
 echo
 
 if [ "$MODE" = "1" ]; then
+  # Na een herstart eerst op NetBird wachten (de website luistert op dat adres).
+  $SUDO env PROJECT_DIR="$INSTALL_DIR" sh "$INSTALL_DIR/start.sh" installeer || true
   say "Website koppelen via NetBird"
   $SUDO env PROJECT_DIR="$INSTALL_DIR" sh "$INSTALL_DIR/netbird-website.sh" || \
     echo "Koppelen is nog niet gelukt. Later opnieuw: cd $INSTALL_DIR && sudo sh netbird-website.sh"
+fi
+
+say "De computer beveiligen"
+$SUDO env PROJECT_DIR="$INSTALL_DIR" sh "$INSTALL_DIR/beveilig-server.sh" || \
+  echo "Later opnieuw: cd $INSTALL_DIR && sudo sh beveilig-server.sh"
+
+say "Beheerservice (optioneel)"
+cat <<'TXT'
+Extra dienst van de beheerder:
+  - elke nacht een versleutelde back-up buiten de deur (niet te wissen vanaf hier);
+  - een versleutelde gegevensmap (onleesbaar als de computer wordt gestolen);
+  - meldingen en bewaking.
+Zonder beheerservice werkt alles gewoon lokaal, met elke nacht een back-up op deze computer.
+Je hebt er een koppelcode van de beheerder voor nodig. Later aanzetten kan ook:
+  cd <map van de installatie> && sudo sh beheerservice.sh
+TXT
+if [ "$(ask 'Beheerservice nu aanzetten? (j/n)' n)" = "j" ]; then
+  $SUDO env PROJECT_DIR="$INSTALL_DIR" sh "$INSTALL_DIR/beheerservice.sh" || \
+    echo "Nog niet gelukt. Later opnieuw: cd $INSTALL_DIR && sudo sh beheerservice.sh"
 fi
 
 say "Klaar!"
@@ -186,9 +246,9 @@ echo "Installatiecode:  $CODE"
 echo
 echo "Map:              $INSTALL_DIR"
 echo "Back-ups:         $INSTALL_DIR/data/backups (elke nacht)"
+echo "Beheerservice:    cd $INSTALL_DIR && sudo sh beheerservice.sh status"
 echo "Logs bekijken:    cd $INSTALL_DIR && docker compose logs -f backend"
 if [ "$MODE" = "1" ]; then
-  NB_IP=$($SUDO netbird status --json 2>/dev/null | jq -r '.netbirdIp // empty' | cut -d/ -f1)
   echo
   echo "Beheer op afstand: verbind je eigen laptop met NetBird en gebruik"
   echo "                  ssh <gebruiker>@${NB_IP:-<NetBird-IP van deze computer>}"
