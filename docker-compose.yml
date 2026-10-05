@@ -1,0 +1,97 @@
+# Webbuilder - installatie met kant-en-klare images (aanbevolen).
+#
+# Normaal maak je dit niet met de hand: install.sh zet deze map op, maakt
+# .env aan en start alles. Daarna open je de website en doorloop je de
+# installatie-wizard.
+#
+# Alles wat per installatie verschilt staat in .env (zie .env.example).
+# Onderdelen:
+#   db        PostgreSQL-database
+#   backend   de server (API, mails, planning)
+#   frontend  de website zelf (nginx)
+#   caddy     HTTPS-certificaat + doorsturen naar de website (profiel "https";
+#             niet nodig als je al een reverse proxy hebt, zoals Nginx Proxy Manager)
+#   onderhoud dagelijkse back-up van de database + automatisch bijwerken
+#             (profiel "autoupdate")
+# Welke profielen aan staan bepaalt COMPOSE_PROFILES in .env.
+
+name: ${COMPOSE_PROJECT_NAME:-webbuilder}
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-webbuilder}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Zet POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-webbuilder}
+    volumes:
+      - ${PGDATA_PATH:-./data/postgres}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-webbuilder} -d ${POSTGRES_DB:-webbuilder}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    image: ${IMAGE_PREFIX:-ghcr.io/thomvanvugt/webbuilder}-backend:${WEBBUILDER_VERSION:-latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-webbuilder}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-webbuilder}
+      TZ: ${APP_TIMEZONE:-Europe/Amsterdam}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ${UPLOADS_PATH:-./data/uploads}:/app/uploads
+
+  frontend:
+    image: ${IMAGE_PREFIX:-ghcr.io/thomvanvugt/webbuilder}-frontend:${WEBBUILDER_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      # Met Caddy (profiel "https") alleen bereikbaar op de server zelf.
+      # Eigen reverse proxy (bv. Nginx Proxy Manager)? Zet in .env
+      # FRONTEND_BIND=0.0.0.0 en stuur je proxy door naar deze poort.
+      - "${FRONTEND_BIND:-127.0.0.1}:${FRONTEND_PORT:-8110}:80"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    profiles: ["https"]
+    depends_on:
+      - frontend
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    # Vraagt zelf een gratis certificaat aan (Let's Encrypt) voor DOMAIN en
+    # vernieuwt het automatisch. De domeinnaam moet naar deze server wijzen.
+    command: caddy reverse-proxy --from ${DOMAIN:-localhost} --to frontend:80
+    volumes:
+      - ${CADDY_DATA_PATH:-./data/caddy}:/data
+
+  onderhoud:
+    image: docker:27-cli
+    restart: unless-stopped
+    profiles: ["autoupdate"]
+    depends_on:
+      - backend
+    environment:
+      PROJECT_DIR: ${PROJECT_DIR:-/opt/webbuilder}
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-webbuilder}
+      UPDATE_HOUR: ${UPDATE_HOUR:-4}
+      AUTO_UPDATE: ${AUTO_UPDATE:-true}
+      BACKUP_KEEP: ${BACKUP_KEEP:-14}
+      POSTGRES_USER: ${POSTGRES_USER:-webbuilder}
+      POSTGRES_DB: ${POSTGRES_DB:-webbuilder}
+      TZ: ${APP_TIMEZONE:-Europe/Amsterdam}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Zelfde pad binnen als buiten, zodat docker compose de mappen en .env
+      # precies zo ziet als op de server.
+      - ${PROJECT_DIR:-/opt/webbuilder}:${PROJECT_DIR:-/opt/webbuilder}
+    working_dir: ${PROJECT_DIR:-/opt/webbuilder}
+    entrypoint: ["sh", "${PROJECT_DIR:-/opt/webbuilder}/onderhoud.sh"]
