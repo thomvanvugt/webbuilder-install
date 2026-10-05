@@ -9,10 +9,15 @@
 #
 # Wat dit doet:
 #   1. controleert of Docker er is (en biedt aan het te installeren)
-#   2. vraagt het domein (bv. www.mijnvereniging.nl) of je eigen proxy-poort
+#   2. vraagt hoe de website bereikbaar wordt:
+#        - via NetBird (mini-pc bij een vereniging: geen poorten openzetten,
+#          en jij kunt er op afstand bij),
+#        - rechtstreeks met eigen domein (server met publiek IP, bv. VPS), of
+#        - achter je eigen reverse proxy (bv. Nginx Proxy Manager)
 #   3. maakt de map aan met docker-compose.yml, onderhoud.sh en een .env
 #      met willekeurig gemaakte wachtwoorden en sleutels
-#   4. start alles en laat de link + installatiecode zien
+#   4. start alles, koppelt (bij NetBird) het domein en laat de link +
+#      installatiecode zien
 # Daarna open je de website en doorloop je de installatie-wizard.
 set -eu
 
@@ -22,7 +27,7 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/webbuilder}"
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 ask() { # ask "vraag" "standaard"
-  if [ -r /dev/tty ]; then
+  if (exec < /dev/tty) 2>/dev/null; then
     printf '%s%s: ' "$1" "${2:+ [$2]}" > /dev/tty
     read -r answer < /dev/tty || answer=""
   else
@@ -61,24 +66,63 @@ cd "$INSTALL_DIR"
 say "Bestanden ophalen"
 $SUDO curl -fsSL "$REPO_RAW/docker-compose.yml" -o docker-compose.yml
 $SUDO curl -fsSL "$REPO_RAW/onderhoud.sh" -o onderhoud.sh
+$SUDO curl -fsSL "$REPO_RAW/netbird-website.sh" -o netbird-website.sh
 
 # 3. Vragen
-say "Een paar vragen"
-DOMAIN=$(ask "Domeinnaam van de website (leeg = ik heb al een eigen reverse proxy)" "")
+say "Hoe wordt de website bereikbaar?"
+cat <<'TXT'
+  1) Via NetBird - voor een mini-pc bij een vereniging (aanbevolen).
+     Geen poorten openzetten in de router; jij kunt er op afstand bij.
+  2) Rechtstreeks met eigen domein - server met een publiek IP-adres (bv. een VPS).
+     HTTPS-certificaat via Caddy; poort 80 en 443 moeten open staan.
+  3) Achter mijn eigen reverse proxy (bv. Nginx Proxy Manager).
+TXT
+MODE=$(ask "Keuze (1, 2 of 3)" "1")
 PROFILES="autoupdate"
 BIND="127.0.0.1"
 PORT="8110"
-if [ -n "$DOMAIN" ]; then
-  DOMAIN=$(echo "$DOMAIN" | sed -e 's#^https\?://##' -e 's#/.*$##')
-  PROFILES="https,autoupdate"
-  URL="https://$DOMAIN"
-  echo "Zorg dat $DOMAIN naar het IP-adres van deze server wijst (A-record bij je domeinprovider)."
-  echo "Poort 80 en 443 moeten open staan; het HTTPS-certificaat wordt automatisch aangevraagd."
-else
-  BIND="0.0.0.0"
-  PORT=$(ask "Op welke poort moet de website luisteren? (stuur je proxy hierheen)" "8110")
-  URL="http://$(hostname -I 2>/dev/null | awk '{print $1}'):$PORT"
-fi
+DOMAIN=""
+case "$MODE" in
+  1)
+    DOMAIN=$(ask "Domeinnaam (bv. mijnvereniging.nl; de website wordt www.mijnvereniging.nl)" "")
+    [ -n "$DOMAIN" ] || { echo "Een domeinnaam is nodig."; exit 1; }
+    DOMAIN=$(echo "$DOMAIN" | sed -e 's#^https\?://##' -e 's#/.*$##' -e 's/^www\.//' | tr 'A-Z' 'a-z')
+    # NetBird stuurt bezoekers via de tunnel naar deze poort.
+    BIND="0.0.0.0"
+    URL="https://www.$DOMAIN"
+    command -v jq >/dev/null 2>&1 || { $SUDO apt-get update -q >/dev/null 2>&1; $SUDO apt-get install -y -q jq >/dev/null 2>&1; } || { echo "Installeer eerst jq."; exit 1; }
+    if ! $SUDO netbird status 2>/dev/null | grep -q "Management: Connected"; then
+      echo
+      echo "Koppel deze computer aan je NetBird-account. Maak een setup key aan in"
+      echo "app.netbird.io -> Setup Keys -> Create Setup Key (bij voorkeur eenmalig te gebruiken)."
+      NB_KEY=$(ask "NetBird setup key" "")
+      [ -n "$NB_KEY" ] || { echo "Zonder setup key kan NetBird niet gekoppeld worden."; exit 1; }
+      command -v netbird >/dev/null 2>&1 || curl -fsSL https://pkgs.netbird.io/install.sh | $SUDO sh
+      $SUDO netbird up --setup-key "$NB_KEY" --hostname "webbuilder-$(echo "$DOMAIN" | tr '.' '-')"
+    else
+      echo "Deze computer is al met NetBird verbonden."
+    fi
+    if command -v apt-get >/dev/null 2>&1 && [ "$(ask 'Automatische beveiligingsupdates voor het systeem aanzetten? (j/n)' j)" = "j" ]; then
+      $SUDO apt-get install -y -q unattended-upgrades >/dev/null 2>&1 && \
+        echo 'APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";' | $SUDO tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null && echo "Aan."
+    fi
+    ;;
+  2)
+    DOMAIN=$(ask "Domeinnaam van de website (bv. www.mijnvereniging.nl)" "")
+    [ -n "$DOMAIN" ] || { echo "Een domeinnaam is nodig."; exit 1; }
+    DOMAIN=$(echo "$DOMAIN" | sed -e 's#^https\?://##' -e 's#/.*$##')
+    PROFILES="https,autoupdate"
+    URL="https://$DOMAIN"
+    echo "Zorg dat $DOMAIN naar het IP-adres van deze server wijst (A-record bij je domeinprovider)."
+    echo "Poort 80 en 443 moeten open staan; het HTTPS-certificaat wordt automatisch aangevraagd."
+    ;;
+  *)
+    BIND="0.0.0.0"
+    PORT=$(ask "Op welke poort moet de website luisteren? (stuur je proxy hierheen)" "8110")
+    URL="http://$(hostname -I 2>/dev/null | awk '{print $1}'):$PORT"
+    ;;
+esac
 AUTO=$(ask "Automatisch bijwerken naar nieuwe versies? (j/n)" j)
 [ "$AUTO" = "j" ] && AUTO_UPDATE=true || AUTO_UPDATE=false
 NAME=$(basename "$INSTALL_DIR" | tr -cd 'a-z0-9-' )
@@ -100,6 +144,8 @@ WEBBUILDER_VERSION=latest
 AUTO_UPDATE=$AUTO_UPDATE
 UPDATE_HOUR=4
 
+# Bereikbaarheid: 1 = NetBird, 2 = Caddy (eigen domein), 3 = eigen reverse proxy
+ACCESS_MODE=$MODE
 DOMAIN=$DOMAIN
 FRONTEND_BIND=$BIND
 FRONTEND_PORT=$PORT
@@ -128,6 +174,12 @@ while [ $i -lt 60 ]; do
 done
 echo
 
+if [ "$MODE" = "1" ]; then
+  say "Website koppelen via NetBird"
+  $SUDO env PROJECT_DIR="$INSTALL_DIR" sh "$INSTALL_DIR/netbird-website.sh" || \
+    echo "Koppelen is nog niet gelukt. Later opnieuw: cd $INSTALL_DIR && sudo sh netbird-website.sh"
+fi
+
 say "Klaar!"
 echo "Open:             $URL/setup?code=$CODE"
 echo "Installatiecode:  $CODE"
@@ -135,3 +187,9 @@ echo
 echo "Map:              $INSTALL_DIR"
 echo "Back-ups:         $INSTALL_DIR/data/backups (elke nacht)"
 echo "Logs bekijken:    cd $INSTALL_DIR && docker compose logs -f backend"
+if [ "$MODE" = "1" ]; then
+  NB_IP=$($SUDO netbird status --json 2>/dev/null | jq -r '.netbirdIp // empty' | cut -d/ -f1)
+  echo
+  echo "Beheer op afstand: verbind je eigen laptop met NetBird en gebruik"
+  echo "                  ssh <gebruiker>@${NB_IP:-<NetBird-IP van deze computer>}"
+fi
