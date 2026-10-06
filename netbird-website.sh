@@ -15,7 +15,7 @@
 # korte geldigheid (1 dag) en verwijder het daarna in het dashboard.
 #
 # Ook:
-#   - alleen het EU-proxycluster (eu.proxy.netbird.io) wordt gebruikt
+#   - alleen een EU-proxycluster (adres begint met eu, bv. eu1.netbird.services) wordt gebruikt
 #     (AVG: bezoekersverkeer via de EU). Anders stopt het script;
 #   - deze computer komt in de NetBird-groep "webbuilder-kastjes", zodat je
 #     met policies kunt regelen waar hij wel en niet bij mag;
@@ -72,8 +72,8 @@ if [ -z "$TOKEN" ]; then
   say "Handmatig instellen in het NetBird-dashboard"
   cat <<TXT
 0. Zet deze computer in de groep "webbuilder-kastjes" (Peers -> deze computer -> Groups)
-1. Reverse Proxy -> Custom Domains -> Add Domain: $BASE (kies proxy cluster eu.proxy.netbird.io - alleen EU!)
-2. Zet bij je domeinprovider:  CNAME  *.$BASE  ->  (het adres dat NetBird toont, bv. eu.proxy.netbird.io)
+1. Reverse Proxy -> Custom Domains -> Add Domain: $BASE (kies het EU-cluster, bv. eu1.netbird.services - alleen EU!)
+2. Zet bij je domeinprovider:  CNAME  *.$BASE  ->  (het adres dat NetBird toont, bv. eu1.netbird.services)
    en klik daarna in NetBird op "Verify Domain".
 3. Reverse Proxy -> Services -> Add Service:
      domein  $SITE
@@ -127,9 +127,9 @@ else
 fi
 
 CLUSTERS=$(api GET /api/reverse-proxies/clusters)
-CLUSTER=$(echo "$CLUSTERS" | jq -r '[.[]? | select(.online != false) | select(.address | startswith("eu."))][0].address // empty')
+CLUSTER=$(echo "$CLUSTERS" | jq -r '[.[]? | select(.online != false) | select(.address | test("^eu[0-9]*[.-]"))][0].address // empty')
 if [ -z "$CLUSTER" ]; then
-  [ "${NB_ALLOW_NON_EU:-}" = "1" ] || fail "Geen proxy-cluster in de EU (eu.…) gevonden ($(echo "$CLUSTERS" | jq -r '[.[]?.address] | join(", ")' 2>/dev/null)). Voor de AVG loopt bezoekersverkeer alleen via de EU. Bewust anders? Draai dan met NB_ALLOW_NON_EU=1."
+  [ "${NB_ALLOW_NON_EU:-}" = "1" ] || fail "Geen proxy-cluster in de EU (eu…) gevonden ($(echo "$CLUSTERS" | jq -r '[.[]?.address] | join(", ")' 2>/dev/null)). Voor de AVG loopt bezoekersverkeer alleen via de EU. Bewust anders? Draai dan met NB_ALLOW_NON_EU=1."
   CLUSTER=$(echo "$CLUSTERS" | jq -r '[.[]? | select(.online != false)][0].address // empty')
   [ -n "$CLUSTER" ] || fail "Geen NetBird proxy-cluster gevonden. Staat Reverse Proxy aan in je account?"
 fi
